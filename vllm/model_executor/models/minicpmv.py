@@ -1494,6 +1494,108 @@ class MiniCPMV2_6(MiniCPMVBaseModel, SupportsLoRA):
         return loader.load_weights(weights)
 
 
+class MiniCPMV3_0(MiniCPMVBaseModel, SupportsLoRA):
+    """MiniCPM-V 3.0. Uses MiniCPM LLM backbone + Idefics2 vision
+    + Resampler2_5. Same vision pipeline as v2.6 but paired with
+    MiniCPM language model instead of Qwen2."""
+
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        assert self.version == (3, 0)
+
+    def init_llm(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ) -> nn.Module:
+        return MiniCPMForCausalLM(vllm_config=vllm_config, prefix=prefix)
+
+    def init_vision_module(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        model = Idefics2VisionTransformer(
+            config.vision_config,
+            quant_config=quant_config,
+            apply_encoder_attention_mask=True,
+            prefix=prefix,
+        )
+        if self.config.drop_vision_last_layer:
+            model.encoder.layers = model.encoder.layers[:-1]
+        return model
+
+    def init_resampler(
+        self,
+        embed_dim: int,
+        vision_dim: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        with set_default_torch_dtype(torch.float16):
+            resampler = Resampler2_5(
+                num_queries=self.config.query_num,
+                embed_dim=embed_dim,
+                num_heads=embed_dim // 128,
+                kv_dim=vision_dim,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        target_device = current_platform.device_type
+        target_dtype = torch.get_default_dtype()
+        if any(p.is_meta for p in resampler.parameters()):
+            return resampler.to_empty(device=target_device).to(dtype=target_dtype)
+        return resampler.to(device=target_device, dtype=target_dtype)
+
+    def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
+        pixel_values = data["pixel_values"]
+        tgt_sizes = data["tgt_sizes"]
+
+        B = len(pixel_values)
+        P = pixel_values[0].shape[-2]
+        L = max(item.shape[-1] for item in pixel_values)
+        device = pixel_values[0].device
+        dtype = pixel_values[0].dtype
+
+        all_pixel_values = torch.zeros((B, 3, P, L), dtype=dtype, device=device)
+        for i, pixel_values_item in enumerate(pixel_values):
+            L_item = pixel_values_item.shape[-1]
+            all_pixel_values[i, ..., :L_item] = pixel_values_item
+
+        num_patches = tgt_sizes.prod(-1)
+        max_patches = num_patches.max().item()
+        assert isinstance(max_patches, int)
+
+        patch_attn_mask = torch.zeros((B, max_patches), dtype=torch.bool, device=device)
+        for i, num_patches_item in enumerate(num_patches):
+            patch_attn_mask[i, :num_patches_item] = True
+
+        vision_embedding = self.vpm(
+            all_pixel_values,
+            patch_attention_mask=patch_attn_mask.unsqueeze(1),
+            tgt_sizes=tgt_sizes,
+        )
+
+        return self.resampler(vision_embedding, tgt_sizes)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self, skip_prefixes=["apm.", "audio", "tts"])
+        return loader.load_weights(weights)
+
+
 class MiniCPMV4_0(MiniCPMVBaseModel, SupportsLoRA):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1699,6 +1801,7 @@ _SUPPORT_VERSION = {
     (2, 0): MiniCPMV2_0,
     (2, 5): MiniCPMV2_5,
     (2, 6): MiniCPMV2_6,
+    (3, 0): MiniCPMV3_0,
     (4, 0): MiniCPMV4_0,
     (4, 5): MiniCPMV4_5,
 }
